@@ -3,6 +3,7 @@ Upload a zipped shapefile or GeoJSON, pick a polygon, see weather at its centroi
 Run:  streamlit run app.py
 """
 import io
+import re
 import tempfile
 import time
 import zipfile
@@ -15,7 +16,9 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from shapely import union_all
+from shapely.geometry import Point
 from streamlit_folium import st_folium
+from streamlit_geolocation import streamlit_geolocation
 
 st.set_page_config(page_title="Polygon Weather Explorer", page_icon="🌦️", layout="wide")
 
@@ -292,7 +295,7 @@ def model_chart(raw: dict):
 
 
 # --------------------------------------------------------------------------- map
-def build_map(view, sel_idx, colors, lat, lon, bounds):
+def build_map(view, sel_idx, colors, lat, lon, bounds, label="Weather point"):
     cols = [c for c in view.columns if not c.startswith("_") and c not in ("geometry", "Area (ha)")][:7] + ["Area (ha)"]
     show = view[cols + ["_idx", "_farm", "_field", "geometry"]].copy()
     for c in cols:
@@ -318,50 +321,96 @@ def build_map(view, sel_idx, colors, lat, lon, bounds):
         tooltip=folium.GeoJsonTooltip(fields=["_farm", "_field", "Area (ha)"], aliases=["Farm", "Field", "Area (ha)"]),
         popup=folium.GeoJsonPopup(fields=cols, aliases=cols, max_width=300),
     ).add_to(m)
-    folium.Marker([lat, lon], tooltip=f"Weather point: {lat:.5f}, {lon:.5f}",
-                  icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
+    if lat is not None:
+        folium.Marker([lat, lon], tooltip=f"{label}: {lat:.5f}, {lon:.5f}",
+                      icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
     folium.LayerControl(collapsed=True).add_to(m)
     m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]], padding=(20, 20))
     return m
 
 
 # --------------------------------------------------------------------------- app
-st.title("🌦️ Farm & Field Weather Explorer")
-st.caption("Pick farm(s) and a field to see weather at that location, with forecast confidence (data: Open-Meteo).")
+EXTS = {".geojson", ".json", ".zip"}
+GPS, PLACE, FARM = "📱 My location", "🔎 Place or coordinates", "Farm / field"
 
-files = sorted(DATA_DIR.glob("*.geojson"))
+
+def load_many(items):
+    """Read, clean and merge many boundary files. Each file's name is kept as the fallback farm name."""
+    parts, notes, errors = [], [], []
+    for name, data in items:
+        try:
+            g, n = prepare_layer(read_layer(data, name))
+        except ValueError as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+        g["_source"] = Path(name).stem
+        parts.append(g)
+        notes += [f"{Path(name).stem}: {x}" for x in n]
+    if not parts:
+        return None, notes, errors
+    gdf = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=4326)
+    gdf["_idx"] = range(len(gdf))
+    return gdf, notes, errors
+
+
+@st.cache_data(show_spinner="Loading farm boundaries…")
+def load_dir(sig):
+    return load_many([(Path(p).name, Path(p).read_bytes()) for p, _ in sig])
+
+
+@st.cache_data(show_spinner="Reading uploaded files…")
+def load_uploads(items):
+    return load_many(list(items))
+
+
+@st.cache_data(ttl=3600, show_spinner="Searching places…")
+def geocode(name: str):
+    r = requests.get("https://geocoding-api.open-meteo.com/v1/search",
+                     params={"name": name, "count": 5, "language": "en", "format": "json"}, timeout=10)
+    r.raise_for_status()
+    return r.json().get("results", [])
+
+
+st.title("🌦️ Farm & Field Weather Explorer")
+st.caption("Pick farm(s) and a field, or use your phone's location, to see weather with forecast confidence "
+           "(Open-Meteo). On a phone, open the farm/field filters with the **›** arrow at the top left.")
+mode = st.radio("Weather for", [FARM, GPS, PLACE], horizontal=True)
+
 with st.sidebar:
     st.header("1 · Boundaries")
-    up = st.file_uploader("Use my own file instead (optional)", type=["zip", "geojson", "json"])
+    ups = st.file_uploader("Use my own files instead (optional)", type=["zip", "geojson", "json"],
+                           accept_multiple_files=True)
 
-raw = None
-try:
-    if up is not None:
-        raw = read_layer(up.getvalue(), up.name)
-    elif files:
-        raw = read_layer(files[0].read_bytes(), files[0].name)
-except ValueError as exc:
-    st.error(f"❌ {exc}")
+sig = tuple((str(p), p.stat().st_mtime) for p in sorted(DATA_DIR.rglob("*")) if p.is_file() and p.suffix.lower() in EXTS)
+if ups:
+    gdf, notes, errors = load_uploads(tuple((u.name, u.getvalue()) for u in ups))
+elif sig:
+    gdf, notes, errors = load_dir(sig)
+else:
+    gdf, notes, errors = None, [], []
+for e in errors:
+    st.sidebar.warning(e)
+if gdf is None:
+    st.error("No boundaries found. Put GeoJSON (or zipped shapefile) files in the repo's `data/` folder, "
+             "or upload them in the sidebar.")
     st.stop()
-if raw is None:
-    st.error("No boundaries found. Add a GeoJSON to the repo's `data/` folder (e.g. `data/boundaries.geojson`) "
-             "or upload one in the sidebar.")
-    st.stop()
+st.sidebar.caption(f"Loaded {gdf['_source'].nunique()} file(s) · {len(gdf)} fields")
+if notes:
+    with st.sidebar.expander("Data notes"):
+        for n in notes:
+            st.write("•", n)
 
-try:
-    gdf, notes = prepare_layer(raw)
-except ValueError as exc:
-    st.error(f"❌ {exc}")
-    st.stop()
-
-attrs = [c for c in gdf.columns if c not in ("geometry", "_idx", "Area (ha)")]
+attrs = [c for c in gdf.columns if c not in ("geometry", "_idx", "_source", "Area (ha)")]
 fg, fl = guess(attrs, FARM_KEYS), guess(attrs, FIELD_KEYS)
 with st.sidebar.expander("Column mapping", expanded=not (fg and fl)):
-    farm_col = st.selectbox("Farm column", ["(none)"] + attrs, index=attrs.index(fg) + 1 if fg else 0)
-    field_col = st.selectbox("Field column", ["(row number)"] + attrs, index=attrs.index(fl) + 1 if fl else 0)
+    farm_opts, field_opts = ["(file name)"] + attrs, ["(row number)"] + attrs
+    farm_col = st.selectbox("Farm column", farm_opts, index=farm_opts.index(fg) if fg else 0)
+    field_col = st.selectbox("Field column", field_opts, index=field_opts.index(fl) if fl else 0)
 
-gdf["_farm"] = "All fields" if farm_col == "(none)" else gdf[farm_col].astype(str)
-gdf["_field"] = (gdf["_idx"] + 1).astype(str) if field_col == "(row number)" else gdf[field_col].astype(str)
+gdf["_farm"] = (gdf["_source"] if farm_col == "(file name)"
+                else gdf[farm_col].where(gdf[farm_col].notna(), gdf["_source"])).astype(str)
+rownum = (gdf.groupby("_farm").cumcount() + 1).astype(str)
+gdf["_field"] = rownum if field_col == "(row number)" else gdf[field_col].where(gdf[field_col].notna(), rownum).astype(str)
 dup = gdf.duplicated(["_farm", "_field"], keep=False)
 gdf.loc[dup, "_field"] = gdf.loc[dup, "_field"] + " (#" + (gdf.loc[dup, "_idx"] + 1).astype(str) + ")"
 
@@ -369,43 +418,99 @@ farms = sorted(gdf["_farm"].unique())
 colors = {f: PALETTE[i % len(PALETTE)] for i, f in enumerate(farms)}
 
 with st.sidebar:
-    st.header("2 · Select")
-    sel_farms = st.multiselect("Farm(s)", farms, default=farms[:1])
+    st.header("2 · Farms & fields")
+    sel_farms = farms if st.checkbox(f"Select all {len(farms)} farms", value=False) else \
+        st.multiselect("Farm(s)", farms, default=farms[:1])
     if not sel_farms:
         st.info("Select at least one farm.")
         st.stop()
     view = gdf[gdf["_farm"].isin(sel_farms)]
     multi = len(sel_farms) > 1
     labels = {int(i): (f"{f} · {fl_}" if multi else fl_) for i, f, fl_ in zip(view["_idx"], view["_farm"], view["_field"])}
-    sel_field = st.selectbox("Field", [-1] + list(labels), format_func=lambda i: "Whole selection (all fields)" if i < 0 else labels[i])
+    field_q = st.text_input("🔍 Search fields", placeholder="type part of a field name").strip().lower()
+    opts = [i for i in labels if field_q in labels[i].lower()]
+    if field_q:
+        st.caption(f"{len(opts)} of {len(labels)} fields match")
+    sel_field = st.selectbox("Field", [-1] + opts, help="You can also type inside this box to search.",
+                             format_func=lambda i: "Whole selection (all fields)" if i < 0 else labels[i])
     st.header("3 · Options")
     days = st.slider("Forecast days", 1, 16, 7)
     zoom_sel = st.checkbox("Zoom to selection", value=True)
 
-for n in notes:
-    st.toast(n, icon="ℹ️")
-
-if sel_field >= 0:
-    row = gdf.loc[gdf["_idx"] == sel_field].iloc[0]
-    geom, title, area = row.geometry, f"{row['_farm']} · {row['_field']}", row["Area (ha)"]
+lat = lon = geom = None
+title, src, point_label = "", "", "Weather point"
+if mode == FARM:
+    if sel_field >= 0:
+        row = gdf.loc[gdf["_idx"] == sel_field].iloc[0]
+        geom, title, area = row.geometry, f"{row['_farm']} · {row['_field']}", row["Area (ha)"]
+    else:
+        geom = union_all(list(view.geometry))
+        title = ", ".join(sel_farms) if len(sel_farms) <= 3 else f"{len(sel_farms)} farms"
+        area = view["Area (ha)"].sum()
+    lat, lon = centroid_latlon(geom)
+elif mode == GPS:
+    loc = streamlit_geolocation()
+    la, lo = (loc.get("latitude"), loc.get("longitude")) if isinstance(loc, dict) else (None, None)
+    if la is not None and lo is not None:
+        lat, lon, title, point_label = float(la), float(lo), "Your location", "You are here"
+        acc = loc.get("accuracy")
+        src = f"GPS ±{acc:,.0f} m" if acc else "GPS"
+    else:
+        st.info("Tap the location button above and allow access. If it doesn't work, enable location for this "
+                "site in your browser settings, or use **Place or coordinates**.")
 else:
-    geom = union_all(list(view.geometry))
-    title = ", ".join(sel_farms) if len(sel_farms) <= 3 else f"{len(sel_farms)} farms"
-    area = view["Area (ha)"].sum()
-lat, lon = centroid_latlon(geom)
+    place_q = st.text_input("Place name or `lat, lon`", placeholder="e.g. Nairobi   or   -1.2921, 36.8219").strip()
+    if place_q:
+        mc = re.match(r"^(-?\d+(?:\.\d+)?)\s*[, ]\s*(-?\d+(?:\.\d+)?)$", place_q)
+        if mc:
+            la, lo = float(mc.group(1)), float(mc.group(2))
+            if -90 <= la <= 90 and -180 <= lo <= 180:
+                lat, lon, title, src = la, lo, f"{la:.4f}, {lo:.4f}", "Coordinates"
+            else:
+                st.error("Latitude must be −90…90 and longitude −180…180.")
+        else:
+            try:
+                res = geocode(place_q)
+            except requests.RequestException as exc:
+                st.error(f"Place search failed: {exc}")
+                res = None
+            if res is not None and not res:
+                st.warning("No places found. Try another spelling or enter coordinates.")
+            elif res:
+                name_of = lambda r: ", ".join(filter(None, [r.get("name"), r.get("admin1"), r.get("country")]))
+                pick = st.selectbox("Match", range(len(res)), format_func=lambda i: name_of(res[i]))
+                lat, lon, title, src = res[pick]["latitude"], res[pick]["longitude"], name_of(res[pick]), "Place search"
+        point_label = "Selected place"
 
-st.subheader(f"📍 {title}")
+if lat is not None:
+    st.subheader(f"📍 {title}")
 c1, c2, c3 = st.columns(3)
 c1.metric("Farms / fields shown", f"{len(sel_farms)} / {len(view)}")
-c2.metric("Area", f"{area:,.2f} ha" if pd.notna(area) else "n/a")
-c3.metric("Weather point", f"{lat:.4f}, {lon:.4f}")
+if mode == FARM:
+    c2.metric("Area", f"{area:,.2f} ha" if pd.notna(area) else "n/a")
+else:
+    c2.metric("Source", src or "–")
+c3.metric("Weather point", f"{lat:.4f}, {lon:.4f}" if lat is not None else "–")
 
-bounds = geom.bounds if (sel_field >= 0 and zoom_sel) else view.total_bounds
-st_folium(build_map(view, sel_field, colors, lat, lon, bounds), use_container_width=True, height=450,
-          returned_objects=[], key="map")
+if mode != FARM and lat is not None:
+    hit = gdf[gdf.geometry.contains(Point(lon, lat))]
+    if not hit.empty:
+        st.success(f"📍 This point is inside {hit.iloc[0]['_farm']} · {hit.iloc[0]['_field']}")
+
+if mode == FARM and sel_field >= 0 and zoom_sel:
+    bounds = geom.bounds
+elif mode != FARM and lat is not None:
+    bounds = (lon - 0.02, lat - 0.02, lon + 0.02, lat + 0.02)
+else:
+    bounds = view.total_bounds
+st_folium(build_map(view, sel_field if mode == FARM else -1, colors, lat, lon, bounds, point_label),
+          use_container_width=True, height=450, returned_objects=[], key="map")
 
 with st.expander(f"Attribute table ({len(view)} fields)"):
-    st.dataframe(pd.DataFrame(view.drop(columns=["geometry", "_idx", "_farm", "_field"])), width="stretch")
+    st.dataframe(pd.DataFrame(view.drop(columns=["geometry", "_idx", "_farm", "_field", "_source"])), width="stretch")
+
+if lat is None:
+    st.stop()
 
 st.divider()
 st.header("Weather")
