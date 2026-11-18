@@ -3,6 +3,7 @@ Upload a zipped shapefile or GeoJSON, pick a polygon, see weather at its centroi
 Run:  streamlit run app.py
 """
 import io
+import math
 import re
 import tempfile
 import time
@@ -295,6 +296,24 @@ def model_chart(raw: dict):
 
 
 # --------------------------------------------------------------------------- map
+def km_between(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    a = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 6371 * 2 * math.asin(math.sqrt(a))
+
+
+def rain_chart(df, mm_col, prob_col, title):
+    """Rain amount (bars, mm) with rain probability (line, %) on a second axis."""
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df["time"], y=df[mm_col], name="Rain (mm)", marker_color="#2ca02c"))
+    fig.add_trace(go.Scatter(x=df["time"], y=df[prob_col], name="Probability (%)", mode="lines",
+                             line=dict(color="#4c78a8"), yaxis="y2"))
+    fig.update_layout(title=title, template="plotly_white", hovermode="x unified", height=320,
+                      margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.2),
+                      yaxis=dict(title="mm"), yaxis2=dict(title="%", overlaying="y", side="right", range=[0, 100]))
+    return fig
+
+
 def build_map(view, sel_idx, colors, lat, lon, bounds, label="Weather point"):
     cols = [c for c in view.columns if not c.startswith("_") and c not in ("geometry", "Area (ha)")][:7] + ["Area (ha)"]
     show = view[cols + ["_idx", "_farm", "_field", "geometry"]].copy()
@@ -531,8 +550,12 @@ except WeatherError as exc:
 cur = w.get("current", {})
 desc, icon = wmo(cur.get("weather_code"))
 st.markdown(f"### {icon} {desc}")
+g_lat, g_lon = w.get("latitude"), w.get("longitude")
+grid_txt = ""
+if g_lat is not None and g_lon is not None:
+    grid_txt = f" · model grid point {g_lat:.2f}, {g_lon:.2f} ({km_between(lat, lon, g_lat, g_lon):.0f} km from your point)"
 st.caption(f"Local time at site: {cur.get('time', '–').replace('T', ' ')} · timezone {w.get('timezone', '–')} · "
-           f"grid elevation {w.get('elevation', '–')} m")
+           f"grid elevation {w.get('elevation', '–')} m{grid_txt}")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Temperature", f"{cur.get('temperature_2m', '–')} °C")
 m2.metric("Feels like", f"{cur.get('apparent_temperature', '–')} °C")
@@ -560,10 +583,13 @@ with t1:
                                                 ("apparent_temperature", "Feels like")],
                                "Hourly temperature", "°C"), width="stretch")
 with t2:
-    st.plotly_chart(bar_chart(hourly, "time", "precipitation_probability", "Hourly precipitation probability",
-                              "%", "#4c78a8"), width="stretch")
-    st.plotly_chart(bar_chart(daily, "time", "precipitation_sum", "Daily precipitation total", "mm", "#2ca02c"),
-                    width="stretch")
+    st.plotly_chart(rain_chart(hourly, "precipitation", "precipitation_probability",
+                               "Hourly rain amount and probability"), width="stretch")
+    st.plotly_chart(rain_chart(daily, "precipitation_sum", "precipitation_probability_max",
+                               "Daily rain total and peak probability"), width="stretch")
+    st.caption("Rain amount (mm) comes from detailed forecast models and varies from place to place. Probability is "
+               "estimated from an ensemble of forecast runs on a coarser grid, in coarse steps, so nearby (and sometimes "
+               "far apart) places can share the same value even when their rain amounts differ.")
 with t3:
     st.plotly_chart(line_chart(hourly, "time", [("wind_speed_10m", "Wind speed"), ("wind_gusts_10m", "Gusts")],
                                "Hourly wind (10 m)", "km/h"), width="stretch")
